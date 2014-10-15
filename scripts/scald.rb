@@ -6,6 +6,7 @@ require 'open-uri'
 require 'thread'
 require 'trollop'
 require 'yaml'
+require 'tmpdir'
 
 USAGE = <<END
 Usage : scald.rb [options] job <job args>
@@ -90,6 +91,7 @@ OPTS_PARSER = Trollop::Parser.new do
   opt :json, "Add scalding-json to classpath"
   opt :parquet, "Add scalding-parquet to classpath"
   opt :repl, "Add scalding-repl to classpath"
+  opt :tool, "The scalding main class, defaults to com.twitter.scalding.Tool", :type => String
 
   stop_on_unknown #Stop parsing for options parameters once we reach the job file.
 end
@@ -127,31 +129,83 @@ if OPTS[:clean]
   exit(0)
 end
 
-if ARGV.size < 1
+if ARGV.size < 1 && OPTS[:repl].nil?
   $stderr.puts USAGE
   OPTS_PARSER::educate
   exit(0)
 end
 
 SCALA_VERSION= OPTS[:scalaversion] || BUILDFILE.match(/scalaVersion\s*:=\s*\"([^\"]+)\"/)[1]
+SHORT_SCALA_VERSION = SCALA_VERSION.start_with?("2.10") ?  "2.10" : SCALA_VERSION
 
 SBT_HOME="#{ENV['HOME']}/.sbt"
 
-SCALA_LIB_DIR="#{SBT_HOME}/boot/scala-#{SCALA_VERSION}/lib"
+SCALA_LIB_DIR = Dir.tmpdir + "/scald.rb/scala_home/#{SCALA_VERSION}"
 
 def scala_libs(version)
   if( version.start_with?("2.10") )
-    ["scala-library.jar", "scala-reflect.jar"]
+    ["scala-library", "scala-reflect", "scala-compiler"]
   else
-    ["scala-library.jar"]
+    ["scala-library", "scala-compiler"]
   end
 end
 
-SCALA_LIBS=scala_libs(SCALA_VERSION)
+def find_dependencies(org, dep, version)
+  res = %x[./sbt 'set libraryDependencies := Seq("#{org}" % "#{dep}" % "#{version}")' 'printDependencyClasspath'].split("\n")
+  mapVer = {}
+  res.map { |l|
+    l,m,r = l.partition(" => ")
+    if (m == " => ")
+      removedSome = l.sub(/Some\(/, '').sub(/\)$/,'')
+      removeExtraBraces = removedSome.sub(/ .*/, '') # In 2.10.4 for resolution for some reason there is a " ()" at the end
+      mapVer[removeExtraBraces] = r
+    else
+      []
+    end
+  }
 
-LIBCP=(SCALA_LIBS.map { |j| "#{SCALA_LIB_DIR}/#{j}" }).join(":")
+  mapVer
+end
 
-COMPILE_CMD="java -cp #{LIBCP}:#{SCALA_LIB_DIR}/scala-compiler.jar -Dscala.home=#{SCALA_LIB_DIR} scala.tools.nsc.Main"
+def find_dependency(org, reqDep, version)
+  retDeps = find_dependencies(org, reqDep, version)
+  dep = retDeps["#{org}:#{reqDep}:#{version}"]
+  raise "Dependency #{org}:#{reqDep}:#{version} not found\n#{retDeps}" unless dep
+  dep
+end
+
+def get_dep_location(org, dep, version)
+  f = "#{SCALA_LIB_DIR}/#{dep}-#{version}.jar"
+  ivyPath = "#{ENV['HOME']}/.ivy2/cache/#{org}/#{dep}/jars/#{dep}-#{version}.jar"
+  if File.exists?(f)
+    f
+  elsif File.exists?(ivyPath)
+    puts "Found #{dep} in ivy path"
+    f = ivyPath
+  else
+    puts "#{dep} was not where it was expected, #{SCALA_LIB_DIR}...finding..."
+    f = find_dependency(org, dep, version)
+    raise "Unable to find jar library: #{dep}" unless f and File.exists?(f)
+    puts "Found #{dep} in #{File.dirname(f)}"
+    f
+  end
+end
+
+libs = scala_libs(SCALA_VERSION).map { |l| get_dep_location("org.scala-lang", l, SCALA_VERSION) }
+lib_dirs = libs.map { |f| File.dirname(f) }
+
+FileUtils.mkdir_p(SCALA_LIB_DIR)
+
+libs.map! do |l|
+  if File.dirname(l) != SCALA_LIB_DIR
+    FileUtils.cp(l, SCALA_LIB_DIR)
+  end
+  "#{SCALA_LIB_DIR}/#{File.basename(l)}"
+end
+
+LIBCP= libs.join(":")
+
+COMPILE_CMD="java -cp #{LIBCP} -Dscala.home=#{SCALA_LIB_DIR} scala.tools.nsc.Main"
 
 HOST = OPTS[:host] || CONFIG["host"]
 
@@ -162,17 +216,6 @@ CLASSPATH =
     CONFIG["cp"]
   end
 
-if (!CONFIG["jar"])
-  #what jar has all the dependencies for this job
-  SHORT_SCALA_VERSION = SCALA_VERSION.start_with?("2.10") ?  "2.10" : SCALA_VERSION
-  CONFIG["jar"] = repo_root + "/scalding-core/target/scala-#{SHORT_SCALA_VERSION}/scalding-core-assembly-#{SCALDING_VERSION}.jar"
-end
-
-#Check that we can find the jar:
-if (!File.exist?(CONFIG["jar"]))
-  puts("#{CONFIG["jar"]} is missing, you probably need to run sbt assembly")
-  exit(1)
-end
 
 MODULEJARPATHS=[]
 
@@ -198,6 +241,32 @@ end
 
 if OPTS[:repl]
   MODULEJARPATHS.push(repo_root + "/scalding-repl/target/scala-#{SHORT_SCALA_VERSION}/scalding-repl-assembly-#{SCALDING_VERSION}.jar")
+
+  # Here we don't need the overall assembly to work with the repl
+  # the repl target itself should suffice (depends on scalding-core)
+  if CONFIG["jar"].nil?
+    repl_assembly_path = repo_root + "/scalding-repl/target/scala-#{SHORT_SCALA_VERSION}/scalding-repl-assembly-#{SCALDING_VERSION}.jar"
+    if (!File.exist?(repl_assembly_path))
+      puts("When trying to run the repl, the #{repl_assembly_path} is missing, you probably need to run ./sbt scalding-repl/assembly")
+      exit(1)
+    end
+    CONFIG["jar"] = repl_assembly_path
+  end
+
+  if OPTS[:tool].nil?
+    OPTS[:tool] = "com.twitter.scalding.ScaldingShell"
+  end
+end
+
+if (!CONFIG["jar"])
+  #what jar has all the dependencies for this job
+  CONFIG["jar"] = repo_root + "/scalding-core/target/scala-#{SHORT_SCALA_VERSION}/scalding-core-assembly-#{SCALDING_VERSION}.jar"
+end
+
+#Check that we can find the jar:
+if (!File.exist?(CONFIG["jar"]))
+  puts("#{CONFIG["jar"]} is missing, you probably need to run ./sbt assembly")
+  exit(1)
 end
 
 JARFILE =
@@ -209,8 +278,11 @@ JARFILE =
     CONFIG["jar"]
   end
 
-JOBFILE=OPTS_PARSER.leftovers.first
-JOB_ARGS=OPTS_PARSER.leftovers[1..-1].join(" ")
+JOBFILE= OPTS_PARSER.leftovers.first
+JOB_ARGS= JOBFILE.nil? ? "" : OPTS_PARSER.leftovers[1..-1].join(" ")
+JOB_ARGS << " --repl " if OPTS[:repl]
+
+TOOL = OPTS[:tool] || 'com.twitter.scalding.Tool'
 
 #Check that we have all the dependencies, and download any we don't.
 def maven_get(dependencies = DEPENDENCIES)
@@ -326,10 +398,10 @@ end
 
 JARPATH=File.expand_path(JARFILE)
 JARBASE=File.basename(JARFILE)
-JOBPATH=File.expand_path(JOBFILE)
-JOB=get_job_name(JOBFILE)
-JOBJAR=JOB+".jar"
-JOBJARPATH=TMPDIR+"/"+JOBJAR
+JOBPATH=JOBFILE.nil? ? nil : File.expand_path(JOBFILE)
+JOB=JOBFILE.nil? ? nil : get_job_name(JOBFILE)
+JOBJAR=JOB.nil? ? nil : JOB+".jar"
+JOBJARPATH=JOBJAR.nil? ? nil : TMPDIR+"/"+JOBJAR
 
 
 class ThreadList
@@ -448,8 +520,11 @@ def build_job_jar
   FileUtils.rm_rf(BUILDDIR)
 end
 
+def hadoop_classpath
+  (["/usr/share/java/hadoop-lzo-0.4.15.jar", JARBASE, MODULEJARPATHS.map{|n| File.basename(n)}, "job-jars/#{JOBJAR}"].select { |s| s != "" }).flatten.join(":")
+end
+
 def hadoop_command
-  hadoop_classpath = (["/usr/share/java/hadoop-lzo-0.4.15.jar", JARBASE, MODULEJARPATHS.map{|n| File.basename(n)}, "job-jars/#{JOBJAR}"].select { |s| s != "" }).flatten.join(":")
   hadoop_libjars = ([MODULEJARPATHS.map{|n| File.basename(n)}, "job-jars/#{JOBJAR}"].select { |s| s != "" }).flatten.join(",")
   "HADOOP_CLASSPATH=#{hadoop_classpath} " +
     "hadoop jar #{JARBASE} -libjars #{hadoop_libjars} #{hadoop_opts} #{JOB} --hdfs " +
@@ -457,7 +532,7 @@ def hadoop_command
 end
 
 def jar_mode_command
-  "hadoop jar #{JARBASE} #{hadoop_opts} #{JOB} --hdfs " + JOB_ARGS
+  "HADOOP_CLASSPATH=#{JARBASE} hadoop jar #{JARBASE} #{hadoop_opts} #{JOB} --hdfs " + JOB_ARGS
 end
 
 #Always sync the remote JARFILE
@@ -486,9 +561,16 @@ if is_file?
 end
 
 def local_cmd(mode)
-  classpath = ([JARPATH, MODULEJARPATHS].select { |s| s != "" } + convert_dependencies_to_jars).flatten.join(":") + (is_file? ? ":#{JOBJARPATH}" : "") +
+  localHadoopDepPaths = if OPTS[:hdfs_local]
+    hadoop_version = BUILDFILE.match(/val hadoopVersion\s*=\s*\"([^\"]+)\"/)[1]
+    find_dependencies("org.apache.hadoop", "hadoop-core", hadoop_version).values
+  else
+    []
+  end
+
+  classpath = ([JARPATH, MODULEJARPATHS].select { |s| s != "" } + convert_dependencies_to_jars + localHadoopDepPaths).flatten.join(":") + (is_file? ? ":#{JOBJARPATH}" : "") +
                 ":" + CLASSPATH
-  "java -Xmx#{LOCALMEM} -cp #{classpath} com.twitter.scalding.Tool #{JOB} #{mode} " + JOB_ARGS
+  "java -Xmx#{LOCALMEM} -cp #{classpath} #{TOOL} #{JOB} #{mode} #{JOB_ARGS}"
 end
 
 SHELL_COMMAND =
@@ -516,11 +598,27 @@ SHELL_COMMAND =
     Trollop::die "no mode set"
   end
 
+def getStty()
+  `stty -g 2> /dev/null`.strip
+end
+
+def restoreStty(stty)
+  if(stty.length > 10)
+    `stty #{stty}`
+  end
+end
+
+
+savedStty=""
 #Now block on all the threads:
 begin
   THREADS.waitall { |c| puts "Waiting for #{c} background thread#{c > 1 ? 's' : ''}..." if c > 0 }
+  savedStty = getStty
   #If there are no errors:
-  exit(system(SHELL_COMMAND))
+  exitCode = system(SHELL_COMMAND)
+  restoreStty(savedStty)
+  exit(exitCode)
 rescue
+  restoreStty(savedStty)
   exit(1)
 end
